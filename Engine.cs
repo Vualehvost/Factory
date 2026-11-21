@@ -1,19 +1,19 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Collections.Concurrent;
 
 namespace RobotFactoryBot;
 
 public record struct RobotSpec(string Color, bool Handles);
 
-/// <summary>
-/// Состояние отдельного прогона (изолировано по runId).
-/// </summary>
 public class RunSession
 {
     public StartRequest Config { get; }
     public Dictionary<string, BuyerModel> Buyers { get; } = new();
     public List<RobotSpec> AllRobotSpecs { get; } = new();
+    public Dictionary<string, int> ItemArrivalTick { get; } = new();
 
-    // Кэш для идемпотентности по seq
     private int _lastSeq = -1;
     private EventResponse _lastResponse = new();
     private readonly object _lock = new();
@@ -24,28 +24,18 @@ public class RunSession
 
         var colors = new List<string> { "red", "green", "blue" };
         if (config.Attributes.TryGetValue("color", out var colorElems) && colorElems.Count > 0)
-        {
             colors = colorElems.Select(e => e.GetString() ?? "red").ToList();
-        }
 
         var handlesList = new List<bool> { false, true };
         if (config.Attributes.TryGetValue("handles", out var handleElems) && handleElems.Count > 0)
-        {
             handlesList = handleElems.Select(e => e.GetBoolean()).ToList();
-        }
 
         foreach (var c in colors)
-        {
             foreach (var h in handlesList)
-            {
                 AllRobotSpecs.Add(new RobotSpec(c, h));
-            }
-        }
 
         foreach (var buyerId in config.Buyers)
-        {
             Buyers[buyerId] = new BuyerModel(buyerId, AllRobotSpecs, config.PriceCeiling);
-        }
     }
 
     public EventResponse ProcessEvent(EventRequest req)
@@ -53,9 +43,7 @@ public class RunSession
         lock (_lock)
         {
             if (req.Seq == _lastSeq)
-            {
                 return _lastResponse;
-            }
 
             var response = FactoryEngine.Decide(this, req);
             _lastSeq = req.Seq;
@@ -65,34 +53,20 @@ public class RunSession
     }
 }
 
-/// <summary>
-/// Модель знаний о покупателе: объединяет матрицу ценовых вилок (low..high)
-/// и дедуктивный фильтр гипотез идеального образца (Pmax, f).
-/// </summary>
 public class BuyerModel
 {
     public string BuyerId { get; }
     private readonly Dictionary<RobotSpec, PriceRange> _ranges = new();
-    private readonly List<SampleHypothesis> _hypotheses = new();
-    private readonly double _priceCeiling;
     private readonly Dictionary<RobotSpec, double> _lastOfferedPrice = new();
+    private readonly double _priceCeiling;
 
     public class PriceRange
     {
         public double Low { get; set; }
         public double High { get; set; }
         public bool Confirmed { get; set; }
+        public int Refusals { get; set; }
         public double? LastSoldPrice { get; set; }
-    }
-
-    private class SampleHypothesis
-    {
-        public RobotSpec Target { get; init; }
-        public double PmaxLow { get; set; } = 45.0;
-        public double PmaxHigh { get; set; } = 75.0;
-        public double FLow { get; set; } = 0.30;
-        public double FHigh { get; set; } = 0.60;
-        public bool IsPossible { get; set; } = true;
     }
 
     public BuyerModel(string buyerId, List<RobotSpec> allSpecs, double priceCeiling)
@@ -102,21 +76,18 @@ public class BuyerModel
 
         foreach (var spec in allSpecs)
         {
-            // Максимально возможная цена Pmax в v1 = 75 (ограничена priceCeiling)
             _ranges[spec] = new PriceRange
             {
                 Low = 0.0,
                 High = Math.Min(75.0, priceCeiling),
                 Confirmed = false
             };
-
-            _hypotheses.Add(new SampleHypothesis
-            {
-                Target = spec,
-                PmaxLow = 45.0,
-                PmaxHigh = Math.Min(75.0, priceCeiling)
-            });
         }
+    }
+
+    public void RecordOfferAttempt(RobotSpec spec, double minPrice)
+    {
+        _lastOfferedPrice[spec] = minPrice;
     }
 
     public void UpdateFromSaleResult(RobotSpec spec, string outcome, double? soldPrice, string? reason)
@@ -129,36 +100,58 @@ public class BuyerModel
             double p = soldPrice.Value;
             range.LastSoldPrice = p;
             range.Confirmed = true;
-            // Учитываем поправку +-2%: базовая цена лежит в [p / 1.02, p / 0.98]
-            double baseLow = p / 1.02;
-            double baseHigh = p / 0.98;
-            range.Low = Math.Max(range.Low, baseLow * 0.98);
-            range.High = Math.Min(range.High, baseHigh * 1.02);
+            range.Refusals = 0;
 
-            UpdateHypothesesOnSold(spec, p);
+            // С учетом +-2% разброса оцениваем коридор базовой цены
+            double estBase = p;
+            range.Low = Math.Max(range.Low, estBase * 0.96);
+            range.High = Math.Min(range.High, estBase * 1.04);
+
+            // Логический вывод для других типов этого же покупателя:
+            // Если цена >= 43, значит этот spec почти наверняка идеальный образец (d=0, Pmax >= 45).
+            // Тогда любой робот с d=2 (другой цвет И другие ручки) стоит строго 0!
+            if (p >= 43.0)
+            {
+                foreach (var other in _ranges.Keys.ToList())
+                {
+                    int dist = Distance(spec, other);
+                    if (dist == 2)
+                    {
+                        _ranges[other].Low = 0;
+                        _ranges[other].High = 0;
+                        _ranges[other].Confirmed = true;
+                    }
+                    else if (dist == 1 && !_ranges[other].Confirmed)
+                    {
+                        // При d=1 цена = Pmax * f, где f in [0.30, 0.60]
+                        _ranges[other].Low = Math.Max(_ranges[other].Low, p * 0.29);
+                        _ranges[other].High = Math.Min(_ranges[other].High, p * 0.62);
+                    }
+                }
+            }
         }
         else if (outcome == "refused" && reason == "below_min_price")
         {
-            // Мы знаем цену последнего предложения только через внешнюю запись,
-            // но если она была сохранена при отправке offer — обновляем верхнюю границу.
-            if (_lastOfferedPrice.TryGetValue(spec, out double attemptedMinPrice))
+            range.Refusals++;
+            if (_lastOfferedPrice.TryGetValue(spec, out double attempted))
             {
-                // Так как реальная цена (с учетом до -2% штрафа) оказалась < attemptedMinPrice,
-                // базовая цена точно ниже attemptedMinPrice / 0.98.
-                range.High = Math.Min(range.High, attemptedMinPrice);
-                if (range.Low >= range.High)
-                {
-                    range.Low = Math.Max(0, range.High - 1.0);
-                }
+                range.High = Math.Min(range.High, attempted - 0.5);
 
-                UpdateHypothesesOnRefused(spec, attemptedMinPrice);
+                // Если цена была > 28 и нам отказали, значит это точно не d=0 (ведь Pmax >= 45 -> min 44.1),
+                // а при d=1 максимум возможного Pmax*f = 75 * 0.60 = 45.
+                // Если отказали при цене <= 13.0, значит цена равна 0 (это d=2)!
+                if (attempted <= 13.5)
+                {
+                    range.Low = 0;
+                    range.High = 0;
+                    range.Confirmed = true;
+                }
+                else if (range.Low >= range.High)
+                {
+                    range.Low = Math.Max(0, range.High - 3.0);
+                }
             }
         }
-    }
-
-    public void RecordOfferAttempt(RobotSpec spec, double minPrice)
-    {
-        _lastOfferedPrice[spec] = minPrice;
     }
 
     private static int Distance(RobotSpec a, RobotSpec b)
@@ -169,166 +162,60 @@ public class BuyerModel
         return d;
     }
 
-    private void UpdateHypothesesOnSold(RobotSpec spec, double price)
-    {
-        foreach (var h in _hypotheses.Where(x => x.IsPossible))
-        {
-            int d = Distance(h.Target, spec);
-            if (d == 2)
-            {
-                // При 2 расхождениях базовая цена строго 0
-                if (price > 0.01) h.IsPossible = false;
-            }
-            else if (d == 0)
-            {
-                // Базовая цена = Pmax. С учетом +-2%: price / 1.02 <= Pmax <= price / 0.98
-                double estLow = price / 1.02;
-                double estHigh = price / 0.98;
-                h.PmaxLow = Math.Max(h.PmaxLow, estLow);
-                h.PmaxHigh = Math.Min(h.PmaxHigh, estHigh);
-                if (h.PmaxLow > h.PmaxHigh + 0.5) h.IsPossible = false;
-            }
-            else if (d == 1)
-            {
-                // Базовая цена = Pmax * f. Диапазон Pmax*f in [45*0.30, 75*0.60] = [13.5, 45.0]
-                double estBaseLow = price / 1.02;
-                double estBaseHigh = price / 0.98;
-                if (estBaseHigh < 13.0 || estBaseLow > 46.0)
-                {
-                    h.IsPossible = false;
-                }
-                else
-                {
-                    // Сужаем Pmax и f
-                    h.PmaxLow = Math.Max(h.PmaxLow, estBaseLow / h.FHigh);
-                    h.PmaxHigh = Math.Min(h.PmaxHigh, estBaseHigh / h.FLow);
-                    h.FLow = Math.Max(h.FLow, estBaseLow / h.PmaxHigh);
-                    h.FHigh = Math.Min(h.FHigh, estBaseHigh / h.PmaxLow);
-                    if (h.PmaxLow > h.PmaxHigh + 0.5 || h.FLow > h.FHigh + 0.02)
-                        h.IsPossible = false;
-                }
-            }
-        }
-        RecomputeRangesFromHypotheses();
-    }
-
-    private void UpdateHypothesesOnRefused(RobotSpec spec, double minPrice)
-    {
-        foreach (var h in _hypotheses.Where(x => x.IsPossible))
-        {
-            int d = Distance(h.Target, spec);
-            if (d == 0)
-            {
-                // Pmax * 0.98 < minPrice => Pmax < minPrice / 0.98
-                h.PmaxHigh = Math.Min(h.PmaxHigh, minPrice / 0.98);
-                if (h.PmaxLow > h.PmaxHigh + 0.5) h.IsPossible = false;
-            }
-            else if (d == 1)
-            {
-                // Pmax * f * 0.98 < minPrice
-                double maxProduct = minPrice / 0.98;
-                if (h.PmaxLow * h.FLow > maxProduct + 0.5)
-                {
-                    h.IsPossible = false;
-                }
-                else
-                {
-                    h.PmaxHigh = Math.Min(h.PmaxHigh, maxProduct / h.FLow);
-                    h.FHigh = Math.Min(h.FHigh, maxProduct / h.PmaxLow);
-                }
-            }
-            // Если d == 2 и minPrice > 0, отказ ожидаем и не опровергает гипотезу
-        }
-        RecomputeRangesFromHypotheses();
-    }
-
-    private void RecomputeRangesFromHypotheses()
-    {
-        var active = _hypotheses.Where(x => x.IsPossible).ToList();
-        if (active.Count == 0) return;
-
-        foreach (var kvp in _ranges)
-        {
-            var spec = kvp.Key;
-            var range = kvp.Value;
-            if (range.Confirmed) continue;
-
-            double minPossible = double.MaxValue;
-            double maxPossible = 0.0;
-
-            foreach (var h in active)
-            {
-                int d = Distance(h.Target, spec);
-                if (d == 0)
-                {
-                    minPossible = Math.Min(minPossible, h.PmaxLow);
-                    maxPossible = Math.Max(maxPossible, h.PmaxHigh);
-                }
-                else if (d == 1)
-                {
-                    minPossible = Math.Min(minPossible, h.PmaxLow * h.FLow);
-                    maxPossible = Math.Max(maxPossible, h.PmaxHigh * h.FHigh);
-                }
-                else
-                {
-                    minPossible = Math.Min(minPossible, 0.0);
-                    maxPossible = Math.Max(maxPossible, 0.0);
-                }
-            }
-
-            if (minPossible <= maxPossible)
-            {
-                range.Low = Math.Max(range.Low, minPossible);
-                range.High = Math.Min(range.High, maxPossible);
-            }
-        }
-    }
-
     /// <summary>
-    /// Возвращает оценку ожидаемой выручки и оптимальную цену minPrice для предложения.
+    /// Возвращает (Ожидаемая выручка, minPrice для offer, Вероятность успеха).
     /// </summary>
-    public (double ExpectedValue, double OfferMinPrice, double InfoGain) EvaluateOffer(RobotSpec spec, int ticksLeft)
+    public (double ExpectedValue, double OfferMinPrice, double WinProb) EvaluateOffer(RobotSpec spec, int ticksLeft)
     {
         var r = _ranges[spec];
 
-        // Если цена уже подтверждена продажей — ставим цену чуть ниже известной (с учетом разброса -2%),
-        // чтобы сделка прошла с 99% вероятностью без потери 8 тактов кулдауна.
-        if (r.Confirmed && r.LastSoldPrice.HasValue)
+        // Если знаем точную цену — продаём с запасом 2.5% вниз, чтобы не нарваться на случайный минус
+        if (r.Confirmed)
         {
-            double safePrice = Math.Floor(r.Low * 0.985);
-            return (r.Low, Math.Max(1.0, safePrice), 0.0);
+            if (r.High < 13.5) return (0.0, 0.0, 0.0);
+            double safePrice = Math.Floor((r.LastSoldPrice ?? r.Low) * 0.975);
+            return (r.LastSoldPrice ?? r.Low, Math.Max(13.0, safePrice), 0.98);
         }
 
-        // Если верхняя граница ниже себестоимости сборки + комиссии (около 14), продавать за деньги невыгодно
-        if (r.High < 14.0)
+        // Если верхняя граница уже упала ниже себестоимости (13.5), продавать нет смысла
+        if (r.High < 13.5)
         {
             return (0.0, 0.0, 0.0);
         }
 
-        // Бинарный поиск внутри актуальной вилки [Low, High]
-        // Учитываем, что гипотеза d=0 дает минимум 45, а d=1 максимум 45.
-        double effectiveLow = Math.Max(r.Low, 14.0);
-        double effectiveHigh = r.High;
+        double effLow = Math.Max(r.Low, 13.0);
+        double effHigh = r.High;
+        double offerPrice;
 
-        double midPrice;
-        if (effectiveHigh > 46.0 && effectiveLow < 44.0)
+        // Первый пробный выстрел по неизвестному типу:
+        // Ставим 42.5 — это ниже минимального Pmax (45 * 0.98 = 44.1), но выше среднего Pmax*f (~27).
+        // Так мы за 1 шаг выясняем, идеальный ли это робот для покупателя!
+        if (effHigh > 45.0 && effLow < 42.0 && r.Refusals == 0)
         {
-            // Проверяем, является ли этот робот идеальным образцом (Pmax >= 45)
-            midPrice = 44.5;
+            offerPrice = 42.5;
         }
         else
         {
-            midPrice = Math.Floor((effectiveLow + effectiveHigh) / 2.0);
+            // Классическое деление пополам
+            offerPrice = Math.Floor((effLow + effHigh) * 0.5);
         }
 
-        midPrice = Math.Clamp(midPrice, 14.0, _priceCeiling);
+        offerPrice = Math.Clamp(offerPrice, 13.0, _priceCeiling);
 
-        // Бонус за разведку снижается к концу смены
-        double uncertainty = Math.Max(0, r.High - r.Low);
-        double infoBonus = ticksLeft > 40 ? uncertainty * 0.35 : 0.0;
-        double expected = (effectiveLow + effectiveHigh) * 0.5 + infoBonus;
+        // Оценка ценности предложения (ожидаемая цена + ценность разведки)
+        double midEstimate = (effLow + effHigh) * 0.5;
+        double explorationBonus = (ticksLeft > 50 && r.Refusals < 3) ? (effHigh - effLow) * 0.25 : 0.0;
+        double score = midEstimate + explorationBonus;
 
-        return (expected, midPrice, infoBonus);
+        return (score, offerPrice, 0.5);
+    }
+
+    public double GetBestKnownOrPotentialPrice(RobotSpec spec)
+    {
+        var r = _ranges[spec];
+        if (r.Confirmed) return r.High < 13.5 ? 0.0 : (r.LastSoldPrice ?? r.Low);
+        if (r.High < 13.5) return 0.0;
+        return (Math.Max(r.Low, 13.0) + r.High) * 0.5;
     }
 
     public IEnumerable<DebugBelief> GetDebugBeliefs()
@@ -347,9 +234,6 @@ public class BuyerModel
     }
 }
 
-/// <summary>
-/// Главный планировщик завода.
-/// </summary>
 public static class FactoryEngine
 {
     private static readonly ConcurrentDictionary<string, RunSession> Sessions = new();
@@ -363,7 +247,6 @@ public static class FactoryEngine
     {
         if (!Sessions.TryGetValue(runId, out var session))
         {
-            // На случай, если сервис перезапустился посреди теста — восстанавливаем базовую сессию
             session = new RunSession(new StartRequest
             {
                 RunId = runId,
@@ -376,19 +259,15 @@ public static class FactoryEngine
         return session.ProcessEvent(request);
     }
 
-    public static void FinishRun(string runId)
-    {
-        Sessions.TryRemove(runId, out _);
-    }
+    public static void FinishRun(string runId) => Sessions.TryRemove(runId, out _);
 
     public static DebugResponse? GetDebug(string runId)
     {
         if (!Sessions.TryGetValue(runId, out var session)) return null;
-        var beliefs = session.Buyers.Values.SelectMany(b => b.GetDebugBeliefs()).ToList();
         return new DebugResponse
         {
-            Beliefs = beliefs,
-            Note = "Bayesian hypothesis elimination + binary price search"
+            Beliefs = session.Buyers.Values.SelectMany(b => b.GetDebugBeliefs()).ToList(),
+            Note = "Direct range bisection + structural deduction"
         };
     }
 
@@ -399,7 +278,13 @@ public static class FactoryEngine
         int t = req.T;
         int ticksLeft = Math.Max(0, session.Config.Horizon - t);
 
-        // 1. Обновляем знания о рынке, если пришло событие sale_result
+        // Запоминаем время появления предметов на складе, чтобы отслеживать залежавшиеся
+        foreach (var item in state.Storage.Items)
+        {
+            session.ItemArrivalTick.TryAdd(item.Id, t);
+        }
+
+        // 1. Обновление рынка по результатам сделки
         if (req.Event.Type == "sale_result" && req.Event.BuyerId != null && req.Event.Item != null)
         {
             var color = req.Event.Item.GetColor();
@@ -415,7 +300,6 @@ public static class FactoryEngine
             }
         }
 
-        // Виртуальное состояние текущего такта (чтобы не дублировать предметы и станки)
         var availableItems = state.Storage.Items.ToList();
         var busyMachines = state.Machines
             .Where(m => m.BusyUntil.HasValue && m.BusyUntil.Value > t)
@@ -427,7 +311,7 @@ public static class FactoryEngine
             .ToHashSet();
         int freeStorage = state.Storage.Free;
 
-        // 2. Обработка входящей поставки (supply)
+        // 2. Приём поставок (supply)
         if (req.Event.Type == "supply" && req.Event.Item != null && freeStorage > 0)
         {
             var item = req.Event.Item;
@@ -437,11 +321,12 @@ public static class FactoryEngine
             {
                 commands.Add(FactoryCommand.Accept(item.Id));
                 availableItems.Add(item);
+                session.ItemArrivalTick[item.Id] = t;
                 freeStorage--;
             }
         }
 
-        // 3. Продажа готовых роботов свободным покупателям
+        // 3. Продажа готовых роботов
         var robots = availableItems.Where(i => i.Kind == "robot").ToList();
         foreach (var robot in robots)
         {
@@ -458,14 +343,16 @@ public static class FactoryEngine
             {
                 if (busyBuyers.Contains(buyer.BuyerId)) continue;
 
-                var (expectedVal, minPrice, _) = buyer.EvaluateOffer(spec, ticksLeft);
-                if (expectedVal > 14.0 && expectedVal > bestScore)
+                var (score, minPrice, _) = buyer.EvaluateOffer(spec, ticksLeft);
+                if (score > 13.5 && score > bestScore)
                 {
-                    bestScore = expectedVal;
+                    bestScore = score;
                     bestBuyer = buyer.BuyerId;
                     bestMinPrice = minPrice;
                 }
             }
+
+            int age = t - session.ItemArrivalTick.GetValueOrDefault(robot.Id, t);
 
             if (bestBuyer != null)
             {
@@ -474,42 +361,42 @@ public static class FactoryEngine
                 busyBuyers.Add(bestBuyer);
                 availableItems.Remove(robot);
             }
-            else if (ticksLeft < 10 || (freeStorage <= 1 && AllBuyersRejectSpec(session, spec)))
+            else if (ticksLeft < 8 || AllBuyersRejectSpec(session, spec) || (freeStorage <= 2 && age > 20))
             {
-                // Если робот гарантированно не нужен ни одному покупателю за разумные деньги, а место кончается
+                // Утилизируем неликвидного робота, чтобы не платить 0.5/такт за хранение
                 commands.Add(FactoryCommand.Discard(robot.Id));
                 availableItems.Remove(robot);
                 freeStorage++;
             }
         }
 
-        // Определяем наиболее востребованные спецификации роботов на текущий момент
-        var targetSpecs = RankDesiredSpecs(session, availableItems, ticksLeft);
+        // Оцениваем спрос на каждую из 6 моделей роботов
+        var specDemand = CalculateSpecDemand(session, availableItems);
 
-        // 4. Запуск станков (в порядке приоритета от конца цепочки к началу, чтобы освобождать склад)
+        // 4. Запуск станков
 
         // 4.1. Сборка (m-assemble): окрашенный body + control -> robot
         if (!busyMachines.Contains("m-assemble") && ticksLeft >= 4)
         {
             var paintedBodies = availableItems
                 .Where(i => i.Kind == "body" && i.GetColor() != null)
-                .OrderByDescending(b => GetSpecPriority(targetSpecs, new RobotSpec(b.GetColor()!, b.GetHandles() ?? false)))
+                .OrderByDescending(b => specDemand.GetValueOrDefault(new RobotSpec(b.GetColor()!, b.GetHandles() ?? false), 0))
                 .ToList();
             var control = availableItems.FirstOrDefault(i => i.Kind == "control");
 
-            if (paintedBodies.Count > 0 && control != null)
+            // Не собираем нового робота, если на складе уже пылятся 3 непроданных робота
+            if (paintedBodies.Count > 0 && control != null && robots.Count < 3)
             {
                 var body = paintedBodies[0];
                 commands.Add(FactoryCommand.Start("m-assemble", "assemble", body.Id, control.Id));
                 busyMachines.Add("m-assemble");
                 availableItems.Remove(body);
                 availableItems.Remove(control);
-                // 2 предмета ушли со склада, 1 место зарезервировано под выход станка -> freeStorage += 1
                 freeStorage++;
             }
         }
 
-        // 4.2. Покраска (m-paint): неокрашенный body -> окрашенный body
+        // 4.2. Покраска (m-paint)
         if (!busyMachines.Contains("m-paint") && ticksLeft >= 7)
         {
             var unpaintedBodies = availableItems
@@ -518,20 +405,19 @@ public static class FactoryEngine
 
             if (unpaintedBodies.Count > 0)
             {
-                // Выбираем корпус и цвет, которые дадут самую востребованную комбинацию (color, handles)
                 Item? bestBody = null;
                 string bestColor = "red";
-                double bestPriority = double.MinValue;
+                double bestScore = double.MinValue;
 
                 foreach (var body in unpaintedBodies)
                 {
                     bool hasHandles = body.GetHandles() ?? false;
                     foreach (var color in new[] { "red", "green", "blue" })
                     {
-                        double prio = GetSpecPriority(targetSpecs, new RobotSpec(color, hasHandles));
-                        if (prio > bestPriority)
+                        double score = specDemand.GetValueOrDefault(new RobotSpec(color, hasHandles), 0);
+                        if (score > bestScore)
                         {
-                            bestPriority = prio;
+                            bestScore = score;
                             bestBody = body;
                             bestColor = color;
                         }
@@ -547,7 +433,7 @@ public static class FactoryEngine
             }
         }
 
-        // 4.3. Установка ручек (m-handles): сырой body (color=null, handles=false) -> body (handles=true)
+        // 4.3. Установка ручек (m-handles): БЕЗ принудительного добавления!
         if (!busyMachines.Contains("m-handles") && ticksLeft >= 9)
         {
             var rawBody = availableItems.FirstOrDefault(i =>
@@ -555,18 +441,16 @@ public static class FactoryEngine
 
             if (rawBody != null)
             {
-                // Сравниваем спрос на роботов с ручками и без ручек
-                double demandWithHandles = targetSpecs.Where(x => x.Key.Handles).Sum(x => x.Value);
-                double demandWithoutHandles = targetSpecs.Where(x => !x.Key.Handles).Sum(x => x.Value);
+                double maxWithHandles = specDemand.Where(x => x.Key.Handles).Select(x => x.Value).DefaultIfEmpty(0).Max();
+                double maxWithoutHandles = specDemand.Where(x => !x.Key.Handles).Select(x => x.Value).DefaultIfEmpty(0).Max();
 
-                int existingWithHandles = availableItems.Count(i => i.Kind == "body" && i.GetHandles() == true);
-                int existingWithoutHandles = availableItems.Count(i => i.Kind == "body" && i.GetHandles() == false);
+                int countWithHandles = availableItems.Count(i => i.Kind == "body" && i.GetHandles() == true);
+                int countWithoutHandles = availableItems.Count(i => i.Kind == "body" && i.GetHandles() == false);
 
-                // Делаем ручки, если спрос на них выше или если без ручек уже накопился запас
-                bool shouldAddHandles = (demandWithHandles >= demandWithoutHandles * 0.85 && existingWithHandles <= existingWithoutHandles)
-                                        || existingWithoutHandles >= 2;
-
-                if (shouldAddHandles)
+                // Ставим ручки ТОЛЬКО если лучшие модели с ручками приносят больше денег (или сравнимо, когда без ручек уже есть запас)
+                if (maxWithHandles > 18.0 &&
+                    (maxWithHandles > maxWithoutHandles + 2.0 ||
+                     (maxWithHandles >= maxWithoutHandles - 3.0 && countWithHandles < countWithoutHandles)))
                 {
                     commands.Add(FactoryCommand.Start("m-handles", "add-handles", rawBody.Id));
                     busyMachines.Add("m-handles");
@@ -581,8 +465,7 @@ public static class FactoryEngine
             var sheet = availableItems.FirstOrDefault(i => i.Kind == "sheet");
             int currentBodies = availableItems.Count(i => i.Kind == "body");
 
-            // Не режем слишком много корпусов впрок, чтобы не платить повышенную аренду склада (0.2 против 0.1)
-            if (sheet != null && currentBodies < 4)
+            if (sheet != null && currentBodies < 3)
             {
                 commands.Add(FactoryCommand.Start("m-cut", "cut", sheet.Id));
                 busyMachines.Add("m-cut");
@@ -590,31 +473,21 @@ public static class FactoryEngine
             }
         }
 
-        // 5. Очистка склада при критическом переполнении (discard)
+        // 5. Аварийная очистка склада от перекоса в сырье
         if (freeStorage <= 1)
         {
             int sheets = availableItems.Count(i => i.Kind == "sheet");
             int controls = availableItems.Count(i => i.Kind == "control");
 
-            if (sheets > controls + 2)
+            if (sheets > controls + 1)
             {
-                var extraSheet = availableItems.FirstOrDefault(i => i.Kind == "sheet");
-                if (extraSheet != null)
-                {
-                    commands.Add(FactoryCommand.Discard(extraSheet.Id));
-                    availableItems.Remove(extraSheet);
-                    freeStorage++;
-                }
+                var item = availableItems.FirstOrDefault(i => i.Kind == "sheet");
+                if (item != null) { commands.Add(FactoryCommand.Discard(item.Id)); freeStorage++; }
             }
-            else if (controls > sheets + 2)
+            else if (controls > sheets + 1)
             {
-                var extraControl = availableItems.FirstOrDefault(i => i.Kind == "control");
-                if (extraControl != null)
-                {
-                    commands.Add(FactoryCommand.Discard(extraControl.Id));
-                    availableItems.Remove(extraControl);
-                    freeStorage++;
-                }
+                var item = availableItems.FirstOrDefault(i => i.Kind == "control");
+                if (item != null) { commands.Add(FactoryCommand.Discard(item.Id)); freeStorage++; }
             }
         }
 
@@ -623,23 +496,25 @@ public static class FactoryEngine
 
     private static bool ShouldAcceptSupply(Item item, double price, List<Item> inventory, int freeStorage, int ticksLeft)
     {
-        // В конце смены не закупаем сырье, которое не успеем переработать и продать (минимум 11 тактов на цикл)
         if (ticksLeft < 11) return false;
 
         int sheetsAndBodies = inventory.Count(i => i.Kind == "sheet" || i.Kind == "body");
         int controls = inventory.Count(i => i.Kind == "control");
+        int robots = inventory.Count(i => i.Kind == "robot");
+
+        // Если на складе уже много непроданных роботов — ставим закупку на паузу
+        if (robots >= 3 && freeStorage <= 4) return false;
 
         if (item.Kind == "sheet")
         {
-            // Не берем листы, если их суммарно с корпусами уже слишком много или склад почти забит
-            if (sheetsAndBodies >= 5) return false;
+            if (sheetsAndBodies >= 4) return false;
             if (freeStorage <= 2 && sheetsAndBodies > controls) return false;
             return price <= 6.0;
         }
 
         if (item.Kind == "control")
         {
-            if (controls >= 5) return false;
+            if (controls >= 4) return false;
             if (freeStorage <= 2 && controls > sheetsAndBodies) return false;
             return price <= 5.0;
         }
@@ -647,40 +522,36 @@ public static class FactoryEngine
         return freeStorage > 2;
     }
 
-    private static Dictionary<RobotSpec, double> RankDesiredSpecs(RunSession session, List<Item> inventory, int ticksLeft)
+    private static Dictionary<RobotSpec, double> CalculateSpecDemand(RunSession session, List<Item> inventory)
     {
         var scores = new Dictionary<RobotSpec, double>();
 
         foreach (var spec in session.AllRobotSpecs)
         {
-            // Находим максимальную ожидаемую цену среди всех покупателей
-            double bestBuyerVal = 0;
-            foreach (var buyer in session.Buyers.Values)
-            {
-                var (val, _, _) = buyer.EvaluateOffer(spec, ticksLeft);
-                if (val > bestBuyerVal) bestBuyerVal = val;
-            }
+            // Суммируем две лучшие оценки покупателей (учитывает случай, когда несколько покупателей хотят один тип)
+            var prices = session.Buyers.Values
+                .Select(b => b.GetBestKnownOrPotentialPrice(spec))
+                .OrderByDescending(p => p)
+                .ToList();
 
-            // Штрафуем за уже имеющихся на складе роботов или окрашенные корпуса такого же типа,
-            // чтобы не производить дубликаты под одного покупателя (у него кулдаун 8 тактов)
-            int alreadyInPipeline = inventory.Count(i =>
+            double topPrice = prices.FirstOrDefault();
+            double secondPrice = prices.Skip(1).FirstOrDefault();
+            double demandScore = topPrice + secondPrice * 0.25;
+
+            // Штрафуем за уже произведённых или покрашенных роботов этого типа на складе
+            int inPipeline = inventory.Count(i =>
                 (i.Kind == "robot" || (i.Kind == "body" && i.GetColor() != null)) &&
                 i.GetColor() == spec.Color &&
                 (i.GetHandles() ?? false) == spec.Handles);
 
-            scores[spec] = bestBuyerVal - alreadyInPipeline * 25.0;
+            scores[spec] = demandScore - inPipeline * 30.0;
         }
 
         return scores;
     }
 
-    private static double GetSpecPriority(Dictionary<RobotSpec, double> scores, RobotSpec spec)
-    {
-        return scores.TryGetValue(spec, out var val) ? val : 0.0;
-    }
-
     private static bool AllBuyersRejectSpec(RunSession session, RobotSpec spec)
     {
-        return session.Buyers.Values.All(b => b.EvaluateOffer(spec, 50).ExpectedValue < 12.0);
+        return session.Buyers.Values.All(b => b.GetBestKnownOrPotentialPrice(spec) < 13.5);
     }
 }
